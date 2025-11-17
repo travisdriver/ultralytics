@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, TryExcept, checks, plt_settings
+from ultralytics.utils.torch_utils import autocast
 
 OKS_SIGMA = (
     np.array([0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
@@ -201,7 +202,7 @@ def _get_covariance_matrix(boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
         (torch.Tensor): Covariance matrices corresponding to original rotated bounding boxes.
     """
     # Gaussian bounding boxes, ignore the center points (the first two columns) because they are not needed here.
-    gbbs = torch.cat((boxes[:, 2:4].pow(2) / 12, boxes[:, 4:]), dim=-1)
+    gbbs = torch.cat((boxes[:, 2:4].pow(2) / 4, boxes[:, 4:]), dim=-1)
     a, b, c = gbbs.split(1, dim=-1)
     cos = c.cos()
     sin = c.sin()
@@ -210,14 +211,13 @@ def _get_covariance_matrix(boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return a * cos2 + b * sin2, a * sin2 + b * cos2, (a - b) * cos * sin
 
 
-def probiou(obb1: torch.Tensor, obb2: torch.Tensor, CIoU: bool = False, eps: float = 1e-7) -> torch.Tensor:
+def hellinger_distance(obb1: torch.Tensor, obb2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """
-    Calculate probabilistic IoU between oriented bounding boxes.
+    Calculate Hellinger distance between oriented bounding boxes.
 
     Args:
         obb1 (torch.Tensor): Ground truth OBBs, shape (N, 5), format xywhr.
         obb2 (torch.Tensor): Predicted OBBs, shape (N, 5), format xywhr.
-        CIoU (bool, optional): If True, calculate CIoU.
         eps (float, optional): Small value to avoid division by zero.
 
     Returns:
@@ -245,7 +245,131 @@ def probiou(obb1: torch.Tensor, obb2: torch.Tensor, CIoU: bool = False, eps: flo
     ).log() * 0.5
     bd = (t1 + t2 + t3).clamp(eps, 100.0)
     hd = (1.0 - (-bd).exp() + eps).sqrt()
+
+    return hd
+
+
+def gaussian_angle_metric(ep0: torch.Tensor, ep1: torch.Tensor, eps: float = 1e-7, take_arccos: bool = True) -> torch.Tensor:
+    """Gaussian angle metric between pairs of ellipses.
+
+    Args:
+        ep0: (N, 5) tensor of ellipse params (cx, cy, a, b, theta).
+        ep1: (N, 5) tensor of ellipse params (cx, cy, a, b, theta).
+        eps: Small epsilon for numerical stability.
+
+    Returns:
+        (N,) tensor of angles (in radians).
+    """
+    if ep0.ndim != 2 or ep0.size(-1) != 5:
+        raise ValueError("ep0 must be shape (N, 5)")
+    if ep1.ndim != 2 or ep1.size(-1) != 5:
+        raise ValueError("ep1 must be shape (N, 5)")
+
+    # Unpack
+    cx0, cy0, a0, b0, th0 = ep0.unbind(dim=-1)
+    cx1, cy1, a1, b1, th1 = ep1.unbind(dim=-1)
+
+    # Centers (N,2,1)
+    c0 = torch.stack([cx0, cy0], dim=-1).unsqueeze(-1)
+    c1 = torch.stack([cx1, cy1], dim=-1).unsqueeze(-1)
+    d  = c0 - c1  # (N,2,1)
+
+    # Rotation matrices (N,2,2)
+    c0s, s0s = torch.cos(th0), torch.sin(th0)
+    c1s, s1s = torch.cos(th1), torch.sin(th1)
+
+    R0 = torch.stack([
+        torch.stack([ c0s, -s0s], dim=-1),
+        torch.stack([ s0s,  c0s], dim=-1)
+    ], dim=-2).to(torch.float32)  # (N,2,2)
+
+    R1 = torch.stack([
+        torch.stack([ c1s, -s1s], dim=-1),
+        torch.stack([ s1s,  c1s], dim=-1)
+    ], dim=-2).to(torch.float32)  # (N,2,2)
+
+    # Diagonal precision matrices (inverse covariance in ellipse metric space)
+    # D = diag([4/a^2, 4/b^2]), shape (N,2,2)
+    inv_a0_2 = 4 * (a0.clamp_min(eps)).reciprocal()**2
+    inv_b0_2 = 4 * (b0.clamp_min(eps)).reciprocal()**2
+    inv_a1_2 = 4 * (a1.clamp_min(eps)).reciprocal()**2
+    inv_b1_2 = 4 * (b1.clamp_min(eps)).reciprocal()**2
+
+    D0 = torch.zeros(ep0.size(0), 2, 2, dtype=torch.float32, device=ep0.device)
+    D1 = torch.zeros_like(D0)
+    D0[:, 0, 0] = inv_a0_2
+    D0[:, 1, 1] = inv_b0_2
+    D1[:, 0, 0] = inv_a1_2
+    D1[:, 1, 1] = inv_b1_2
+
+    # Y = R D R^T  (N,2,2)
+    Y0 = R0 @ D0 @ R0.transpose(-1, -2)
+    Y1 = R1 @ D1 @ R1.transpose(-1, -2)
+    S  = Y0 + Y1
+
+    # t1 = 4 * sqrt(det(Y0)*det(Y1)) / det(Y0 + Y1)
+    #detY0 = torch.linalg.det(Y0).clamp_min(eps)
+    #detY1 = torch.linalg.det(Y1).clamp_min(eps)
+    detY0 = (D0[:, 0, 0] * D0[:, 1, 1]).clamp_min(eps)                     # (N,)
+    detY1 = (D1[:, 0, 0] * D1[:, 1, 1]).clamp_min(eps)                     # (N,)
+    detS  = torch.linalg.det(S.to(torch.float32)).clamp_min(eps)
+    t1 = 4.0 * torch.sqrt(detY0 * detY1) / detS
+
+    # t2 = exp(-0.5 * d^T Y0 S^{-1} Y1 d)
+    # Compute v = S^{-1} (Y1 d) using a solve (more stable than explicit inverse)
+    Y1d = Y1 @ d                        # (N,2,1)
+    v   = torch.linalg.solve(S.to(torch.float32), Y1d.to(torch.float32))    # (N,2,1)
+    q   = (d.transpose(-1, -2) @ (Y0 @ v)).squeeze(-1).squeeze(-1)  # (N,)
+    t2  = torch.exp(-0.5 * q)
+
+    # acos argument, clamp for numerical safety
+    arg = (t1 * t2).clamp(-1.0, 1.0)
+    if take_arccos:
+        return torch.arccos(arg).unsqueeze(-1)
+    else:
+        return arg.unsqueeze(-1)
+
+
+def probiou(obb1: torch.Tensor, obb2: torch.Tensor, CIoU: bool = False, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Calculate probabilistic IoU between oriented bounding boxes.
+
+    Args:
+        obb1 (torch.Tensor): Ground truth OBBs, shape (N, 5), format xywhr.
+        obb2 (torch.Tensor): Predicted OBBs, shape (N, 5), format xywhr.
+        CIoU (bool, optional): If True, calculate CIoU.
+        eps (float, optional): Small value to avoid division by zero.
+
+    Returns:
+        (torch.Tensor): OBB similarities, shape (N,).
+
+    Notes:
+        OBB format: [center_x, center_y, width, height, rotation_angle].
+
+    References:
+        https://arxiv.org/pdf/2106.06072v1.pdf
+    """
+    #x1, y1 = obb1[..., :2].split(1, dim=-1)
+    #x2, y2 = obb2[..., :2].split(1, dim=-1)
+    #a1, b1, c1 = _get_covariance_matrix(obb1)
+    #a2, b2, c2 = _get_covariance_matrix(obb2)
+
+    #t1 = (
+    #    ((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)
+    #) * 0.25
+    #t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
+    #t3 = (
+    #    ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
+    #    / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)
+    #    + eps
+    #).log() * 0.5
+    #bd = (t1 + t2 + t3).clamp(eps, 100.0)
+    #hd = (1.0 - (-bd).exp() + eps).sqrt()
+    with torch.cuda.amp.autocast(enabled=False):
+        #hd = 2.0 * gaussian_angle_metric(obb1, obb2, eps=eps, take_arccos=True) / torch.pi
+        hd = 1 - gaussian_angle_metric(obb1, obb2, eps=eps, take_arccos=False)
     iou = 1 - hd
+
     if CIoU:  # only include the wh aspect ratio part
         w1, h1 = obb1[..., 2:4].split(1, dim=-1)
         w2, h2 = obb2[..., 2:4].split(1, dim=-1)

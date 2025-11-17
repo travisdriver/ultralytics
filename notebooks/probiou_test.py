@@ -172,6 +172,8 @@ piou_hd = probiou(obb1, obb2)
 
 piou_ga = gaussian_angle_metric_torch(obb1, obb2, take_arccos=True)
 piou_ga = 1 - 2 * piou_ga / torch.pi
+#piou_ga = gaussian_angle_metric_torch(obb1, obb2, take_arccos=False)
+#piou_ga = 1 - (1 - piou_ga)
 #print(piou_ga)
 
 #print(torch.max(piou))
@@ -183,7 +185,11 @@ piou_ga = 1 - 2 * piou_ga / torch.pi
 # print("Probiou between random ellipses:\n", piou)
 
 plt.plot(piou_hd, piou_ga, "r.")
-plt.plot([0, 1], [0, 1], "b-")
-plt.xlabel("Hellinger Distance")
-plt.ylabel("Gaussian Angle Metric")
-plt.savefig("test.png")
+plt.plot([0, 1], [0, 1], "b-", label=r"$y=x$")
+plt.xlabel(r"Hellinger Distance, $IoU = 1 - d_\mathrm{H}$")
+plt.ylabel(r"Gaussian Angle, $IoU = 1 - 2 d_\mathrm{GA} / \pi$")
+plt.xlim([0, 1])
+plt.ylim([0, 1])
+plt.gca().set_aspect(1)
+plt.legend()
+plt.savefig("test.png", bbox_inches="tight")
